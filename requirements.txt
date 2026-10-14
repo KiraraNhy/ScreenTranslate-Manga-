@@ -1,0 +1,24 @@
+# MangaLens 运行依赖（Python 3.10+，Windows 10/11）
+
+mss>=10.0
+numpy>=1.24
+pillow>=10.0
+opencv-python-headless>=4.8
+requests>=2.31
+
+# 主力识别引擎（ONNX，模型小、速度快、多语言）
+rapidocr>=3.0
+onnxruntime>=1.16
+
+# Windows 自带 OCR（免下载，可选但推荐）
+winsdk>=1.0.0b10; sys_platform == "win32"
+
+# 本地离线翻译（可选，首次会下载 opus-mt 模型）
+sentencepiece>=0.2
+
+# --- 可选：日漫专用识别（质量最好，需要下 400MB 模型） ---
+# manga-ocr
+#
+# --- 可选：PaddleOCR（本机实测与 PaddlePaddle 3.3 推理后端不兼容，暂不建议） ---
+# paddlepaddle
+# paddleocr
