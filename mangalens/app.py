@@ -7,7 +7,7 @@ import time
 import os
 import tkinter as tk
 
-from .border import cached_border
+from .border import cached_border, color_for
 from .config import LANGUAGES, TARGETS, Config
 from .hotkeys import HOTKEYS
 from .overlay import Overlay
@@ -82,7 +82,7 @@ class App:
             rect = pick_region(self.root)
         finally:
             self.root.attributes("-topmost", True)
-            self.overlay.set_visible(self.cfg.enabled)
+            self.overlay.set_visible(True)
         if rect:
             self.apply_config(region=list(rect), mode="region")
             self.set_enabled(True)  # 圈定区域后直接开始翻译
@@ -104,7 +104,15 @@ class App:
         self.pipeline.force_refresh()
 
     def action_refresh(self) -> None:
-        self.pipeline.force_refresh()
+        """重新翻译：清掉现有译文并立刻重来一遍（等同于暂停后再开始）。"""
+        if not self.cfg.region and self.cfg.mode != "fullscreen":
+            self.panel.set_status("还没有框选区域，请先点「框选区域」")
+            return
+        if not self.cfg.enabled:
+            self.panel.set_status("当前是暂停状态，先点「开始翻译」")
+            return
+        self.pipeline.refresh()
+        self.panel.set_stats("正在重新翻译…")
 
     def action_clear(self) -> None:
         self.pipeline.clear()
@@ -114,10 +122,12 @@ class App:
 
         self.set_enabled(not self.cfg.enabled)
         self.panel.sync_enabled(self.cfg.enabled)
+        self._show_border()  # 描边立刻换成对应状态的颜色
 
     def set_enabled(self, value: bool) -> None:
         self.apply_config(enabled=bool(value))
-        self.overlay.set_visible(bool(value))
+        # 覆盖层不隐藏：它同时承载着选区描边（暂停时是红色），隐藏了就看不到范围了
+        self.overlay.set_visible(True)
         if not value:
             self.pipeline.clear()
         else:
@@ -131,7 +141,8 @@ class App:
             return
         left, top, width, height = region
         try:
-            self.overlay.push(region, cached_border(int(width), int(height)), 1.0)
+            color = color_for(bool(self.cfg.enabled))
+            self.overlay.push(region, cached_border(int(width), int(height), color), 1.0)
         except Exception:
             pass
 

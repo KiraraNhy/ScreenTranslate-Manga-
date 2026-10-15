@@ -1,4 +1,4 @@
-"""选区提示描边：让用户随时看得见当前正在翻译的范围。"""
+"""选区提示描边：常驻显示选区，颜色表示运行状态。"""
 
 from __future__ import annotations
 
@@ -8,42 +8,45 @@ import numpy as np
 
 from .blend import over
 
-OUTLINE = (76, 201, 240)  # 亮蓝
-CORNER = (255, 255, 255)
+#: 翻译中（绿）
+RUNNING = (46, 204, 113)
+#: 已暂停（红）
+PAUSED = (231, 76, 60)
 DEFAULT_THICKNESS = 3
-DEFAULT_ALPHA = 165
+DEFAULT_ALPHA = 170
+
+
+def color_for(enabled: bool) -> tuple[int, int, int]:
+    """按运行状态取描边颜色。"""
+
+    return RUNNING if enabled else PAUSED
 
 
 def make_border(
     width: int,
     height: int,
+    color: tuple[int, int, int] = RUNNING,
     thickness: int = DEFAULT_THICKNESS,
     alpha: int = DEFAULT_ALPHA,
 ) -> np.ndarray:
-    """生成一张"只有边框、中间透明"的 RGBA 图。"""
+    """生成一张"只有一圈边框、中间透明"的 RGBA 图。"""
 
     width, height = max(1, int(width)), max(1, int(height))
     frame = np.zeros((height, width, 4), np.uint8)
-    t = max(1, min(thickness, width // 4 or 1, height // 4 or 1))
-    r, g, b = OUTLINE
+    t = max(1, min(int(thickness), width // 4 or 1, height // 4 or 1))
+    r, g, b = color
     frame[:t, :, :] = (r, g, b, alpha)
     frame[height - t :, :, :] = (r, g, b, alpha)
     frame[:, :t, :] = (r, g, b, alpha)
     frame[:, width - t :, :] = (r, g, b, alpha)
-
-    # 四个角加亮，画面花的时候也能看清边界
-    cr, cg, cb = CORNER
-    size = max(10, min(28, min(width, height) // 8))
-    for ys, ye in ((0, size), (height - size, height)):
-        for xs, xe in ((0, size), (width - size, width)):
-            frame[ys:ye, xs:xs + t, :] = (cr, cg, cb, 235)
-            frame[ys:ys + t, xs:xe, :] = (cr, cg, cb, 235)
     return frame
 
 
-@lru_cache(maxsize=4)
-def cached_border(width: int, height: int) -> np.ndarray:
-    return make_border(width, height)
+@lru_cache(maxsize=8)
+def cached_border(
+    width: int, height: int, color: tuple[int, int, int] = RUNNING
+) -> np.ndarray:
+    return make_border(width, height, color)
 
 
 def apply_border(overlay: np.ndarray, border: np.ndarray) -> np.ndarray:

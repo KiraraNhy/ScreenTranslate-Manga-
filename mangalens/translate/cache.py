@@ -113,6 +113,18 @@ class CachedTranslator(Translator):
     def last_error(self) -> str:
         return getattr(self.inner, "last_error", "")
 
+    @property
+    def on_progress(self):
+        return getattr(self.inner, "on_progress", None)
+
+    @on_progress.setter
+    def on_progress(self, value) -> None:
+        # 进度回调要透传给真正的翻译后端，否则面板看不到进度
+        try:
+            self.inner.on_progress = value
+        except Exception:
+            pass
+
     def translate(self, texts: list[str], src: str = "auto", dst: str = "zh") -> list[str]:
         keys = [TranslationCache.make_key(self.inner.name, src, dst, t) for t in texts]
         cached = self.cache.get_many(keys)

@@ -18,7 +18,7 @@ from mangalens.capture import downscale_gray  # noqa: E402
 from mangalens.config import Config  # noqa: E402
 from mangalens.pipeline import (  # noqa: E402
     IDLE_THRESHOLD,
-    MOVE_THRESHOLD,
+    MOTION_THRESHOLD,
     flatten,
     masked_mean_abs,
     overlay_mask_thumbnail,
@@ -117,7 +117,18 @@ def main() -> int:
     scrolled = np.roll(frame, 120, axis=0)
     moved_diff = masked_mean_abs(downscale_gray(scrolled), clean, mask)
     print(f"翻页后差异（应较大）：{moved_diff:.2f}")
-    assert moved_diff > MOVE_THRESHOLD, "翻页后没有检测到画面变化"
+    assert moved_diff > MOTION_THRESHOLD, "翻页后没有检测到画面变化"
+
+    # 选区描边：按运行状态变色，中间透明，四角不再有特殊颜色
+    from mangalens.border import PAUSED, RUNNING, color_for, make_border
+
+    for enabled, expected in ((True, RUNNING), (False, PAUSED)):
+        border = make_border(120, 80, color_for(enabled))
+        assert tuple(border[1, 60][:3]) == expected, "描边颜色与运行状态不符"
+        assert tuple(border[1, 1][:3]) == expected, "四角仍有特殊颜色"
+        assert border[40, 60][3] == 0, "描边中间应当完全透明"
+    assert color_for(True) != color_for(False)
+    print("选区描边：绿=翻译中、红=已暂停，四角无特殊颜色")
 
     out = Path(tempfile.gettempdir()) / "mangalens_pipeline_check.png"
     Image.fromarray(painted).save(out)

@@ -12,7 +12,7 @@ import numpy as np
 
 from . import ocr as ocr_registry
 from . import translate as tr_registry
-from .border import apply_border, cached_border
+from .border import apply_border, cached_border, color_for
 from .capture import Capturer, downscale_gray
 from .compose import Style, compose
 from .config import Config
@@ -20,9 +20,11 @@ from .layout import Block, group_lines, is_translatable, normalize_source_text
 from .win32util import virtual_screen
 
 #: 与"预期画面"差异小于该值 => 屏幕没有变化，不用做任何事
-IDLE_THRESHOLD = 1.5
-#: 差异大于该值 => 还在滚动/翻页，继续等它停下来
-MOVE_THRESHOLD = 6.0
+IDLE_THRESHOLD = 2.5
+#: 相邻两帧差异大于该值 => 画面真的在滚动/播放动画，先别动手
+MOTION_THRESHOLD = 12.0
+#: 连续这么多帧都检测到变化才动手（避开光标闪烁、动画这类一过性的改动）
+CHANGE_STRIKES = 2
 #: 两次识别之间的最小间隔，避免画面轻微抖动时反复识别
 MIN_PROCESS_INTERVAL = 0.4
 
@@ -91,6 +93,10 @@ def translate_frame(
     start = time.perf_counter()
     if progress:
         progress("翻译")
+    try:
+        translator.on_progress = lambda text: progress(text) if progress else None
+    except Exception:
+        pass
     translated = translator.translate(
         [block.text_src for block in blocks], cfg.source_lang, cfg.target_lang
     )
@@ -196,6 +202,7 @@ class Pipeline(threading.Thread):
         self._translator = None
         self._shown_texts: set[str] = set()
         self._border_region: tuple[int, int, int, int] | None = None
+        self._strikes = 0
         self._verbose = bool(os.environ.get("MANGALENS_DEBUG_PIPELINE"))
         self.capturer = Capturer()
 
@@ -204,6 +211,11 @@ class Pipeline(threading.Thread):
         self._stop.set()
 
     def force_refresh(self) -> None:
+        self._force.set()
+
+    def refresh(self) -> None:
+        """清掉当前译文并立刻重新识别翻译一遍（等同于暂停后再开始）。"""
+        self._clear_request.set()
         self._force.set()
 
     def clear(self) -> None:
@@ -250,7 +262,8 @@ class Pipeline(threading.Thread):
     def run(self) -> None:  # noqa: C901 - 主循环保持线性更好读
         base: np.ndarray | None = None  # 上次识别时的画面（没画译文）
         mask: np.ndarray | None = None  # 译文盖住的区域，比较时要跳过
-        stable = 0
+        prev: np.ndarray | None = None  # 上一帧，用来判断画面是不是还在动
+        quiet = 0
         last_process = 0.0
         while not self._stop.is_set():
             cfg = self.settings.snapshot()
@@ -262,6 +275,8 @@ class Pipeline(threading.Thread):
                 self._blank(region, cfg)
                 base, mask = None, None
                 stable = 0
+                time.sleep(min(0.15, interval))
+                continue
 
             if not cfg.enabled or region is None:
                 # 暂停时也在选区周围留一圈描边，让用户看得见范围
@@ -285,15 +300,20 @@ class Pipeline(threading.Thread):
                 continue
 
             small = downscale_gray(frame)
+            ignore = self._merge_mask(mask, self._panel_thumb_mask(region, small))
             if base is not None and base.shape == small.shape:
-                diff = masked_mean_abs(small, base, mask)
+                diff = masked_mean_abs(small, base, ignore)
             else:
                 diff = None
+            motion = 0.0
+            if prev is not None and prev.shape == small.shape:
+                motion = masked_mean_abs(small, prev, ignore)
+            prev = small
             if self._verbose:
                 shown = "无" if diff is None else f"{diff:.2f}"
                 print(
                     f"[tick] diff={shown} base={'有' if base is not None else '无'}"
-                    f" stable={stable} drawn={self._drawn}",
+                    f" motion={motion:.2f} quiet={quiet} drawn={self._drawn}",
                     flush=True,
                 )
 
@@ -302,31 +322,50 @@ class Pipeline(threading.Thread):
 
             # 屏幕还是我们预料的那个样子 => 什么都不用做
             if diff is not None and diff <= IDLE_THRESHOLD and not forced:
-                stable = 0
+                self._strikes = 0
+                quiet = 0
                 time.sleep(interval)
                 continue
 
-            if diff is not None and diff > MOVE_THRESHOLD:
-                stable = 0
-            else:
-                stable += 1
+            # 画面真的在滚动/翻页（帧间差异大）：立刻撤掉旧译文，免得旧译文压在
+            # 已经变了的内容上；这一判断要放在"变化确认"之前，否则会漏掉翻页。
+            if motion > MOTION_THRESHOLD and not forced:
+                quiet = 0
+                self._strikes = 0
+                if self._drawn:
+                    self._blank(region, cfg)
+                    base, mask = None, None
+                    time.sleep(min(0.2, interval))
+                    continue
+                time.sleep(interval)
+                continue
 
-            # 画面变了：先撤掉旧译文，让下一帧抓到没有覆盖层的干净画面
-            if self._drawn:
+            # 变化确认：连续两帧都检测到变化才动手，一过性的改动直接忽略
+            self._strikes = min(self._strikes + 1, 9)
+            if self._strikes < CHANGE_STRIKES and not forced:
+                time.sleep(interval)
+                continue
+
+            quiet += 1
+            if quiet < max(1, int(cfg.settle_frames)):
+                time.sleep(interval)
+                continue
+
+            # 画面已经停下：只有「覆盖层会被截屏捕获」时才需要清屏去抓干净画面，
+            # 否则直接留着旧译文重译，避免「闪一下又还原」
+            if self._drawn and not self._overlay_hidden_from_capture():
                 self._blank(region, cfg)
                 base, mask = None, None
-                stable = 0
+                quiet = 0
+                self._strikes = 0
                 time.sleep(min(0.2, interval))
-                continue
-
-            if stable < max(1, int(cfg.settle_frames)):
-                time.sleep(interval)
                 continue
             if now - last_process < MIN_PROCESS_INTERVAL:
                 time.sleep(interval)
                 continue
 
             last_process = now
+            self._strikes = 0
             self._force.clear()
             overlay = self._process(frame, region, cfg)
             base = small
@@ -346,7 +385,45 @@ class Pipeline(threading.Thread):
             return
         width, height = int(region[2]), int(region[3])
         self._border_region = (region[0], region[1], width, height)
-        self._push(region, cached_border(width, height), cfg, 0)
+        color = color_for(bool(cfg.enabled))
+        self._push(region, cached_border(width, height, color), cfg, 0)
+
+    def _overlay_hidden_from_capture(self) -> bool:
+        """覆盖层是否真的不会被屏幕截图捕获（只有这时才敢留着旧译文直接重译）。"""
+
+        return bool(getattr(self.overlay, "excluded_from_capture", False))
+
+    @staticmethod
+    def _merge_mask(mask, extra):
+        if extra is None:
+            return mask
+        if mask is None:
+            return extra
+        return mask | extra
+
+    def _panel_thumb_mask(self, region, small):
+        """把控制面板那一块排除在变化比较之外（面板上的状态文字会自己刷新）。"""
+
+        if self.panel_rect is None or region is None:
+            return None
+        rect = self.panel_rect()
+        if not rect:
+            return None
+        x0 = rect[0] - region[0]
+        y0 = rect[1] - region[1]
+        if x0 >= region[2] or y0 >= region[3] or x0 + rect[2] <= 0 or y0 + rect[3] <= 0:
+            return None  # 面板根本不在采集区域内
+        sx = small.shape[1] / float(region[2])
+        sy = small.shape[0] / float(region[3])
+        ax0 = max(0, int(x0 * sx) - 1)
+        ay0 = max(0, int(y0 * sy) - 1)
+        ax1 = min(small.shape[1], int((x0 + rect[2]) * sx) + 2)
+        ay1 = min(small.shape[0], int((y0 + rect[3]) * sy) + 2)
+        if ax1 <= ax0 or ay1 <= ay0:
+            return None
+        panel = np.zeros(small.shape, bool)
+        panel[ay0:ay1, ax0:ax1] = True
+        return panel
 
     def _push(self, region, overlay, cfg: Config, count: int) -> None:
         try:
@@ -381,7 +458,7 @@ class Pipeline(threading.Thread):
             block.text_dst.strip() for block in outcome.blocks if block.text_dst
         }
         width, height = int(region[2]), int(region[3])
-        border = cached_border(width, height)
+        border = cached_border(width, height, color_for(bool(cfg.enabled)))
         outcome.overlay = apply_border(outcome.overlay, border)
         self._border_region = (region[0], region[1], width, height)
         self._drawn = outcome.translated > 0

@@ -32,6 +32,7 @@ TOTAL_SECONDS = 30
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--translator", default="echo")
+    parser.add_argument("--config", action="store_true", help="使用真实保存的配置（含密钥）")
     parser.add_argument("--seconds", type=float, default=TOTAL_SECONDS)
     parser.add_argument("--quiet", type=float, default=QUIET_SECONDS)
     args = parser.parse_args()
@@ -49,7 +50,8 @@ def main() -> int:
     root.update()
     time.sleep(0.8)
 
-    cfg = Config()
+    cfg = Config.load() if args.config else Config()
+    cfg.enabled = True  # 自检要跑翻译，忽略保存的暂停状态
     cfg.source_lang = "ja"
     cfg.ocr_backend = "rapidocr"
     cfg.translator = args.translator
@@ -81,8 +83,8 @@ def main() -> int:
                         f"[{time.time() - started:4.1f}s] 翻译 {payload['blocks']} 块"
                         f"，耗时 {payload['total_ms']:.0f}ms"
                     )
-                elif kind == "status":
-                    print(f"[{time.time() - started:4.1f}s] {payload}")
+                elif kind in ("status", "stage"):
+                    print(f"[{time.time() - started:4.1f}s] {kind}: {payload}")
     finally:
         pipeline.stop()
         overlay.stop()

@@ -16,6 +16,8 @@ class Translator:
     name = "base"
     label = "基础"
     needs_network = True
+    #: 可选：翻译过程中的进度回调（例如 "3/9"）
+    on_progress = None
 
     def translate(self, texts: list[str], src: str, dst: str) -> list[str]:
         raise NotImplementedError

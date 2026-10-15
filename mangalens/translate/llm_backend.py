@@ -1,12 +1,15 @@
 """大模型翻译（任意 OpenAI 兼容接口：OpenAI / DeepSeek / 智谱 / 通义 / Kimi / 本地 Ollama 等）。
 
-按整页合并成一次请求（每句前面加序号），避免一屏十几句话发十几次请求导致长时间没反应。
+按整页合并成一次请求，并且用**流式接收**：边生成边解析，收齐条目就提前结束。
+这样即使模型生成得慢也不会被"读取超时"掐断，还能把进度显示出来。
 """
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 
 from .base import Translator
 
@@ -28,10 +31,16 @@ _SYSTEM_BATCH = (
     "5. 不要输出任何解释、标题或多余空行。"
 )
 
-_LINE_RE = re.compile(r"^\s*(\d+)\s*[.、．,:：)）]\s*(.*)$")
+_LINE_RE = re.compile(r"^\s*[（(]?\s*(\d+)\s*[.、．,，:：)）\]]\s*(.*)$")
 
-#: 逐句兜底最多处理这么多条，避免接口异常时长时间卡住
+#: 这些状态码是"重试也没用"的（密钥、余额、参数问题）
+_PERMANENT_STATUS = (400, 401, 403, 404, 422)
+#: 逐句兜底最多处理这么多条
 _FALLBACK_LIMIT = 6
+
+
+class _PermanentError(RuntimeError):
+    """重试也不会成功的错误。"""
 
 
 class LlmTranslator(Translator):
@@ -46,15 +55,19 @@ class LlmTranslator(Translator):
         proxy: str = "",
         timeout: float = 20.0,
         workers: int = 4,
+        retries: int = 1,
     ) -> None:
         import requests
 
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
-        self.timeout = timeout
+        self.read_timeout = timeout           # 单次"没收到数据"的等待上限
+        self.total_timeout = max(45.0, timeout * 3)   # 整段生成的兜底上限
         self.workers = max(1, int(workers))
+        self.retries = max(0, int(retries))
         self.last_error = ""
+        self.on_progress: Callable[[str], None] | None = None
         self.session = requests.Session()
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
@@ -63,48 +76,116 @@ class LlmTranslator(Translator):
     def _target_name(self, dst: str) -> str:
         return "繁体中文" if dst == "zh-Hant" else "简体中文"
 
-    def _chat(self, system: str, user: str) -> str:
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _post_stream(self, system: str, user: str, feed) -> None:
+        """流式请求；每收到一段内容就交给 feed，feed 返回 True 表示可以提前结束。"""
+
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.2,
-            "max_tokens": 1500,
+            "max_tokens": 2000,
+            "stream": True,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        resp = self.session.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        if resp.status_code != 200:
-            detail = resp.text[:160].replace("\n", " ")
-            raise RuntimeError(f"接口返回 {resp.status_code}：{detail}")
-        data = resp.json()
-        return (data["choices"][0]["message"]["content"] or "").strip()
+        try:
+            response = self.session.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=self._headers(),
+                stream=True,
+                timeout=(min(8.0, self.read_timeout), self.read_timeout),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"连接失败：{type(exc).__name__}") from exc
+
+        try:
+            if response.status_code != 200:
+                body = response.text[:200].replace("\n", " ")
+                message = f"接口返回 {response.status_code}：{body}"
+                if response.status_code in _PERMANENT_STATUS:
+                    raise _PermanentError(message)
+                raise RuntimeError(message)
+
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "event-stream" not in content_type:
+                # 少数兼容接口不支持流式，按普通 JSON 处理
+                text = (response.json()["choices"][0]["message"]["content"] or "").strip()
+                feed(text)
+                return
+
+            deadline = time.monotonic() + self.total_timeout
+            for raw in response.iter_lines(decode_unicode=False):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("大模型响应超过总时限")
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except ValueError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content") or ""
+                if piece and feed(piece):
+                    break
+        except _PermanentError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"读取响应失败：{type(exc).__name__}") from exc
+        finally:
+            response.close()
 
     # ------------------------------------------------------------------ 翻译
-    def _translate_batch(self, texts: list[str], src: str, dst: str) -> list[str] | None:
-        """一次请求翻完整页；序号对不上就返回 None。"""
+    @staticmethod
+    def _collect(line: str, found: dict) -> None:
+        match = _LINE_RE.match(line.strip())
+        if match:
+            found[int(match.group(1))] = match.group(2).strip()
 
+    def _translate_batch(self, texts: list[str], src: str, dst: str) -> list[str] | None:
+        expected = len(texts)
+        found: dict[int, str] = {}
+        buffer = ""
+        started = time.monotonic()
+
+        def feed(piece: str) -> bool:
+            nonlocal buffer
+            buffer += piece
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                self._collect(line, found)
+                if self.on_progress and len(found) != expected:
+                    self.on_progress(
+                        f"翻译 {len(found)}/{expected}（{time.monotonic() - started:.0f}s）"
+                    )
+            return len(found) >= expected
+
+        system = _SYSTEM_BATCH.format(target=self._target_name(dst))
         numbered = "\n".join(
             f"{index + 1}. " + texts[index].replace(chr(10), " ")
-            for index in range(len(texts))
+            for index in range(expected)
         )
-        answer = self._chat(_SYSTEM_BATCH.format(target=self._target_name(dst)), numbered)
-        found: dict[int, str] = {}
-        for line in answer.splitlines():
-            match = _LINE_RE.match(line)
-            if match:
-                found[int(match.group(1))] = match.group(2).strip()
-        if len(found) != len(texts):
+        self._post_stream(system, numbered, feed)
+        if buffer.strip():
+            self._collect(buffer, found)
+        if len(found) != expected:
             return None
-        return [found.get(index + 1, "") for index in range(len(texts))]
+        return [found.get(index + 1, "") for index in range(expected)]
 
     def _per_item(self, texts: list[str], src: str, dst: str, indexes=None) -> dict:
         import concurrent.futures
@@ -115,12 +196,14 @@ class LlmTranslator(Translator):
         system = _SYSTEM_SINGLE.format(target=self._target_name(dst))
 
         def one(index: int):
+            collected: list[str] = []
             try:
-                return index, self._chat(system, texts[index])
+                self._post_stream(system, texts[index], lambda piece: collected.append(piece) or False)
             except Exception as exc:
                 if not self.last_error:
                     self.last_error = str(exc)[:200]
                 return index, ""
+            return index, "".join(collected).strip()
 
         out = {}
         with concurrent.futures.ThreadPoolExecutor(
@@ -134,15 +217,24 @@ class LlmTranslator(Translator):
         if not texts:
             return []
         self.last_error = ""
-        try:
-            batch = self._translate_batch(texts, src, dst)
-        except Exception as exc:
-            self.last_error = str(exc)[:200]
-            return ["" for _ in texts]
-
+        batch: list[str] | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                batch = self._translate_batch(texts, src, dst)
+                self.last_error = ""
+                break
+            except _PermanentError as exc:
+                self.last_error = str(exc)[:200]
+                return ["" for _ in texts]
+            except Exception as exc:
+                self.last_error = str(exc)[:200]
+                if attempt < self.retries:
+                    time.sleep(0.8)  # 稍等一下自动重试一次
         if batch is None:
+            if self.last_error:
+                return ["" for _ in texts]
             if len(texts) > _FALLBACK_LIMIT:
-                self.last_error = "模型没有按序号返回，请重试（可按 F7）"
+                self.last_error = "模型没有按序号返回，请按 F7 重试"
                 return ["" for _ in texts]
             self.last_error = "模型没有按序号返回，已改为逐句翻译"
             values = self._per_item(texts, src, dst)
