@@ -118,6 +118,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import App
     from .config import Config
+    from .win32util import acquire_single_instance, message_box
+
+    if not acquire_single_instance():
+        message_box("MangaLens 已经在运行了，请用已经打开的那个控制面板。", "屏幕实时翻译")
+        return 1
 
     cfg = Config.load()
     if args.region:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -118,7 +119,7 @@ def main() -> int:
     print(f"翻页后差异（应较大）：{moved_diff:.2f}")
     assert moved_diff > MOVE_THRESHOLD, "翻页后没有检测到画面变化"
 
-    out = ROOT / "tests" / "out_pipeline.png"
+    out = Path(tempfile.gettempdir()) / "mangalens_pipeline_check.png"
     Image.fromarray(painted).save(out)
     print(f"已保存：{out}")
     print("全部通过")

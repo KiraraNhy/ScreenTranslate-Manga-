@@ -109,6 +109,10 @@ class CachedTranslator(Translator):
         self.last_hits = 0
         self.last_misses = 0
 
+    @property
+    def last_error(self) -> str:
+        return getattr(self.inner, "last_error", "")
+
     def translate(self, texts: list[str], src: str = "auto", dst: str = "zh") -> list[str]:
         keys = [TranslationCache.make_key(self.inner.name, src, dst, t) for t in texts]
         cached = self.cache.get_many(keys)

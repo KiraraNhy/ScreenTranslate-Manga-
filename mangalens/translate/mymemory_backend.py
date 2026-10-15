@@ -119,6 +119,7 @@ class MyMemoryTranslator(Translator):
         self._lock = threading.Lock()
         self._next_call = 0.0
         self.quota_exhausted = False
+        self.last_error = ""
 
     def _throttle(self, interval: float = 0.12) -> None:
         with self._lock:
@@ -144,6 +145,7 @@ class MyMemoryTranslator(Translator):
         upper = translated.upper()
         if any(hint in upper for hint in _QUOTA_HINT):
             self.quota_exhausted = True
+            self.last_error = "MyMemory 免费额度用完了（匿名每天约 5000 字符，设置里填邮箱可提升到 5 万）"
             raise RuntimeError(
                 "MyMemory 免费额度用完了（每天约 5000 字符）。"
                 "可以在设置里填一个邮箱提高到 5 万字符，"
@@ -155,6 +157,7 @@ class MyMemoryTranslator(Translator):
 
     def translate(self, texts: list[str], src: str = "auto", dst: str = "zh") -> list[str]:
         results: list[str] = [""] * len(texts)
+        self.last_error = ""
         if not texts or self.quota_exhausted:
             return results
 
@@ -170,8 +173,9 @@ class MyMemoryTranslator(Translator):
                 return
             try:
                 raw = self._request("\n".join(lines), src, dst)
-            except Exception:
+            except Exception as exc:
                 raw = ""
+                self.last_error = str(exc)[:200]
             parts = [p for p in (raw or "").split("\n") if p.strip()]
             if len(parts) == len(indexes):
                 for index, part in zip(indexes, parts):
@@ -183,8 +187,9 @@ class MyMemoryTranslator(Translator):
                     continue
                 try:
                     results[index] = self.normalize(self._request(line, src, dst), dst)
-                except Exception:
+                except Exception as exc:
                     results[index] = ""
+                    self.last_error = str(exc)[:200]
 
         groups = _group(texts)
         if self.workers == 1 or len(groups) == 1:

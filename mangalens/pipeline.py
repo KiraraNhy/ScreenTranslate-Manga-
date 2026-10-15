@@ -386,6 +386,12 @@ class Pipeline(threading.Thread):
         self._border_region = (region[0], region[1], width, height)
         self._drawn = outcome.translated > 0
         self._push(region, outcome.overlay, cfg, outcome.translated)
+        failed = len(outcome.blocks) - outcome.translated
+        if failed > 0:
+            reason = getattr(self._translator, "last_error", "") or "网络不稳定或额度不足"
+            self.events.put(
+                ("status", f"{failed}/{len(outcome.blocks)} 条译文没拿到：{reason}")
+            )
         total = (time.perf_counter() - started) * 1000
         self.events.put(
             (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 from ctypes import wintypes as wt
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -266,3 +267,27 @@ def cursor_pos() -> tuple[int, int]:
     pt = POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def acquire_single_instance(name: str = "MangaLensSingleInstance") -> bool:
+    """同一时间只允许运行一个实例。返回 False 表示已经有实例在跑。"""
+    global _SINGLE_INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+    kernel32.CreateMutexW.restype = wt.HANDLE
+    _SINGLE_INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, name)
+    return ctypes.get_last_error() != 183
+
+
+def message_box(text: str, title: str = "MangaLens", flags: int = 0x40) -> None:
+    """弹一个系统提示框（0x40 = 信息图标）。"""
+    try:
+        user32.MessageBoxW.argtypes = [wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.UINT]
+        user32.MessageBoxW(None, text, title, flags)
+    except Exception:
+        pass
+

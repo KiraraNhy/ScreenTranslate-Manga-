@@ -1,0 +1,8 @@
+# Python 编译缓存（不进仓库：内部记录了源文件的绝对路径）
+__pycache__/
+*.py[cod]
+
+# 运行/调试产物
+*.tmp
+tests/out_*.png
+.mangalens/

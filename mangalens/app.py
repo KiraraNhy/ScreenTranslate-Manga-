@@ -14,7 +14,7 @@ from .overlay import Overlay
 from .pipeline import Pipeline, Settings, resolve_region
 from .selector import pick_region
 from .ui import ControlPanel
-from .win32util import enable_dpi_awareness
+from .win32util import enable_dpi_awareness, virtual_screen
 
 
 class App:
@@ -32,7 +32,7 @@ class App:
         self.root = tk.Tk()
         self.panel = ControlPanel(self.root, self)
         if cfg.panel_pos and len(cfg.panel_pos) == 2:
-            self.root.geometry(f"+{int(cfg.panel_pos[0])}+{int(cfg.panel_pos[1])}")
+            self._apply_panel_pos(cfg.panel_pos)
         self._save_job = None
         self._last_raise = 0.0
         self._engine_info = ""
@@ -51,6 +51,16 @@ class App:
     # ------------------------------------------------------------------ 生命周期
     def run(self) -> None:
         self.root.mainloop()
+
+    def _apply_panel_pos(self, pos) -> None:
+        """把控制面板限制在可见屏幕内（换显示器或改分辨率后不会跑到屏幕外）。"""
+        self.root.update_idletasks()
+        left, top, width, height = virtual_screen()
+        panel_w = max(320, self.root.winfo_width())
+        panel_h = max(200, self.root.winfo_height())
+        x = min(max(int(pos[0]), left), max(left, left + width - panel_w))
+        y = min(max(int(pos[1]), top), max(top, top + height - panel_h))
+        self.root.geometry(f"+{x}+{y}")
 
     def action_quit(self) -> None:
         try:
